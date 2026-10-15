@@ -77,6 +77,26 @@ with SubscriptionProxy("https://provider.example/subscription") as proxy:
 
 This mode lets Xray's observatory/balancer choose among nodes. It is different from `SubscriptionFailoverSession`, which starts one node at a time and retries requests according to its retry policy.
 
+The observatory uses an HTTP(S) URL to measure node latency (this is not an ICMP ping). By default, it probes YouTube's lightweight `https://www.youtube.com/generate_204` endpoint, which is blocked on many Iranian networks. Filtering varies by ISP and can change over time.
+
+Choose another probe URL in code:
+
+```python
+with SubscriptionProxy(
+    "https://provider.example/subscription",
+    probe_url="https://example.org/generate_204",
+) as proxy:
+    ...
+```
+
+Or set an environment variable so the application can change it without editing code:
+
+```bash
+export XRAY_PROXY_PROBE_URL="https://www.youtube.com/generate_204"
+```
+
+An explicit `probe_url=` argument takes precedence over `XRAY_PROXY_PROBE_URL`. The environment variable is read when `SubscriptionProxy` is created.
+
 ## Supported URI formats
 
 The parser supports VLESS and VMess, with TCP, WebSocket, gRPC, HTTP, and HTTPUpgrade transports, plus TLS and REALITY options represented by common share-link parameters. Unsupported transports/security values raise `ProxyError`.
