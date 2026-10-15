@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xray-proxy"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31.0"]
+
+[project.optional-dependencies]
+socks = ["requests[socks]>=2.31.0"]
+test = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["xray_proxy*"]
