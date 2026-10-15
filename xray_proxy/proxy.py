@@ -319,7 +319,7 @@ class SubscriptionProxy:
     """
     def __init__(self, subscription_url: str, *, xray_path: str = "xray",
                  host: str = "127.0.0.1", port: int = 10808,
-                 startup_timeout: float = 12.0, probe_url: str = "https://shahvani.com/",
+                 startup_timeout: float = 12.0, probe_url: str | None = None,
                  probe_interval: str = "5s", probe_warmup: float = 10.0,
                  ranking_file: str | None = None):
         if host not in {"127.0.0.1", "::1", "localhost"}:
@@ -331,7 +331,13 @@ class SubscriptionProxy:
         self.host = host
         self.port = int(port)
         self.startup_timeout = startup_timeout
-        self.probe_url = probe_url
+        # Xray observatory performs HTTP(S) latency probes (not ICMP ping).
+        # YouTube's lightweight generate_204 endpoint is filtered on many Iranian networks.
+        self.probe_url = probe_url or os.environ.get(
+            "XRAY_PROXY_PROBE_URL", "https://www.youtube.com/generate_204"
+        )
+        if not self.probe_url.startswith(("https://", "http://")):
+            raise ValueError("probe_url must be an HTTP(S) URL")
         self.probe_interval = probe_interval
         self.probe_warmup = max(0.0, float(probe_warmup))
         self.ranking_file = ranking_file or str(Path.home() / ".config" / "xray-proxy" / "node-ranking.json")
