@@ -1,161 +1,152 @@
 #!/usr/bin/env python3
-"""Find a working Xray SOCKS endpoint for a public Instagram reachability check.
+"""Check Instagram reachability through the library's concurrent Xray balancer.
 
-Input is XRAY_PROXY_SUBSCRIPTION_URL, a local subscription file containing either
-node URIs or a single HTTP(S) subscription URL. Share links are never printed.
-The first working node is kept alive until Ctrl-C.
+SubscriptionProxy lets Xray observatory probe many VLESS/VMess outbounds
+concurrently and routes requests through its leastPing balancer. The script
+does not launch one Xray process per node and never prints subscription links.
 """
 from __future__ import annotations
 
-import base64
 import os
 import sys
+import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import requests
-from xray_proxy import ProxyError, XrayProxy, parse_proxy_uri
+from xray_proxy import ProxyError, SubscriptionProxy
 
 CHECK_URL = "https://www.instagram.com/robots.txt"
 DEFAULT_SUBSCRIPTION_FILE = Path.home() / ".config/xray-proxy/subscription.txt"
 DEFAULT_XRAY_PATH = str(Path.home() / "bin/xray")
 DEFAULT_PORT = 10808
-MAX_SUBSCRIPTION_BYTES = 2_000_000
-MAX_NODES = 200
+DEFAULT_PROBE_URL = "https://www.google.com/generate_204"
 
 
-def download_subscription(url: str) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "xray-proxy-instagram-check/1.0"},
-    )
-    with urllib.request.urlopen(request, timeout=25) as response:
-        raw = response.read(MAX_SUBSCRIPTION_BYTES + 1)
-    if len(raw) > MAX_SUBSCRIPTION_BYTES:
-        raise RuntimeError("Subscription is larger than 2 MB.")
-    return raw.decode("utf-8-sig", errors="replace")
-
-
-def decode_subscription(source: str) -> list[str]:
-    lines = [line.strip() for line in source.splitlines() if line.strip()]
-
-    # Subscription files may store the URL rather than the downloaded content.
-    if len(lines) == 1 and lines[0].lower().startswith(("https://", "http://")):
-        source = download_subscription(lines[0])
-        lines = [line.strip() for line in source.splitlines() if line.strip()]
-
-    # Decode base64 subscriptions (standard or URL-safe alphabet).
-    if lines and not any(line.lower().startswith(("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")) for line in lines):
-        compact = "".join(lines)
-        try:
-            decoded_bytes = base64.b64decode(
-                compact + "=" * (-len(compact) % 4),
-                altchars=b"-_",
-                validate=True,
-            )
-            decoded = decoded_bytes.decode("utf-8-sig")
-            if "://" in decoded:
-                source = decoded
-                lines = [line.strip() for line in source.splitlines() if line.strip()]
-        except (ValueError, UnicodeError):
-            pass
-
-    nodes: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
-        lowered = line.lower()
-        if not lowered.startswith(("vless://", "vmess://")) or line in seen:
-            continue
-        try:
-            parse_proxy_uri(line)
-        except (ProxyError, ValueError, TypeError):
-            continue
-        seen.add(line)
-        nodes.append(line)
-        if len(nodes) >= MAX_NODES:
-            break
-
-    if not nodes:
-        raise RuntimeError(
-            "No supported VLESS/VMess nodes found. Check the subscription URL/content and encoding."
-        )
-    return nodes
-
-
-def load_subscription() -> list[str]:
+def load_subscription_url() -> str:
     url = os.environ.get("XRAY_PROXY_SUBSCRIPTION_URL", "").strip()
     if url:
-        source = download_subscription(url)
-    else:
-        path = Path(os.environ.get("XRAY_PROXY_SUBSCRIPTION_FILE", DEFAULT_SUBSCRIPTION_FILE))
-        if not path.is_file():
-            raise RuntimeError(
-                "Subscription file not found. Set XRAY_PROXY_SUBSCRIPTION_URL or "
-                f"create {path} with node URIs or one subscription URL."
-            )
-        if path.stat().st_size > MAX_SUBSCRIPTION_BYTES:
-            raise RuntimeError("Subscription file is larger than 2 MB.")
-        source = path.read_text(encoding="utf-8-sig", errors="replace")
-    return decode_subscription(source)
+        return url
+
+    path = Path(os.environ.get("XRAY_PROXY_SUBSCRIPTION_FILE", DEFAULT_SUBSCRIPTION_FILE))
+    if not path.is_file():
+        raise RuntimeError(
+            "Subscription URL not configured. Set XRAY_PROXY_SUBSCRIPTION_URL or "
+            f"put one HTTPS subscription URL in {path}."
+        )
+    if path.stat().st_size > 2_000_000:
+        raise RuntimeError("Subscription file is larger than 2 MB.")
+
+    lines = [line.strip() for line in path.read_text(
+        encoding="utf-8-sig", errors="replace"
+    ).splitlines() if line.strip()]
+    if len(lines) == 1 and lines[0].lower().startswith(("https://", "http://")):
+        return lines[0]
+    raise RuntimeError(
+        "The current SubscriptionProxy API expects a subscription URL, not a local "
+        "file of raw node links. Put the subscription URL in the configured file or "
+        "set XRAY_PROXY_SUBSCRIPTION_URL."
+    )
+
+
+def progress_worker(stop_event: threading.Event, started: float) -> None:
+    """Show honest live status while Xray probes nodes concurrently."""
+    frames = "|/-\\"
+    index = 0
+    while not stop_event.wait(0.15):
+        elapsed = time.monotonic() - started
+        frame = frames[index % len(frames)]
+        print(
+            f"\r{frame} Xray Observatory is probing nodes concurrently"
+            f" | elapsed {elapsed:5.1f}s",
+            end="",
+            flush=True,
+        )
+        index += 1
+    elapsed = time.monotonic() - started
+    print(f"\r✓ Balancer startup/warm-up completed in {elapsed:.1f}s" + " " * 24)
 
 
 def main() -> int:
+    subscription_url = load_subscription_url()
     xray_path = os.environ.get("XRAY_PATH", DEFAULT_XRAY_PATH)
     port = int(os.environ.get("XRAY_PROXY_PORT", str(DEFAULT_PORT)))
-    nodes = load_subscription()
-    print(f"Loaded {len(nodes)} supported nodes. Checking Instagram public endpoint…")
+    probe_url = os.environ.get("XRAY_PROXY_PROBE_URL", DEFAULT_PROBE_URL)
+    warmup = float(os.environ.get("XRAY_PROXY_PROBE_WARMUP", "10"))
+    interval = os.environ.get("XRAY_PROXY_PROBE_INTERVAL", "5s")
 
-    for index, uri in enumerate(nodes, start=1):
-        session = requests.Session()
-        proxy = XrayProxy(uri, xray_path=xray_path, port=port)
+    proxy = SubscriptionProxy(
+        subscription_url,
+        xray_path=xray_path,
+        port=port,
+        probe_url=probe_url,
+        probe_interval=interval,
+        probe_warmup=warmup,
+    )
+    session = requests.Session()
+    started = time.monotonic()
+    stop_progress = threading.Event()
+    worker = threading.Thread(
+        target=progress_worker, args=(stop_progress, started), daemon=True
+    )
+
+    try:
+        print("Starting Xray's concurrent Observatory / leastPing balancer.")
+        print(f"Probe endpoint: {probe_url}")
+        print(f"Probe interval: {interval}; warm-up: {warmup:g}s")
+        worker.start()
+        proxy.start()
+        stop_progress.set()
+        worker.join()
+        session = proxy.configure_session(session)
+
+        # This single request is a real destination check. Observatory probes
+        # are concurrent; this request confirms the selected route can reach Instagram.
+        check_started = time.monotonic()
         try:
-            with proxy:
-                proxy.configure_session(session)
-                started = time.monotonic()
-                try:
-                    response = session.get(CHECK_URL, timeout=(10, 20), allow_redirects=True)
-                except requests.RequestException as exc:
-                    print(f"[{index}/{len(nodes)}] Connection check failed; trying next node ({type(exc).__name__}).")
-                    continue
+            response = session.get(CHECK_URL, timeout=(10, 20), allow_redirects=True)
+        except requests.RequestException as exc:
+            print(
+                f"Instagram reachability check failed ({type(exc).__name__}). "
+                "The balancer started, but no successful Instagram response was confirmed."
+            )
+            return 2
 
-                elapsed = time.monotonic() - started
-                if response.status_code in (403, 429):
-                    print(
-                        f"Instagram returned HTTP {response.status_code}. "
-                        "This may be a destination restriction/rate limit; stopping without rotating."
-                    )
-                    return 2
-                if 200 <= response.status_code < 400:
-                    print(f"Working node found: {index}/{len(nodes)}")
-                    print(f"Check URL: {CHECK_URL}")
-                    print(f"HTTP status: {response.status_code}; response time: {elapsed:.2f}s")
-                    print(f"Local SOCKS5 endpoint: {proxy.socks_url}")
-                    print("The endpoint stays active until you press Ctrl-C.")
-                    try:
-                        while True:
-                            time.sleep(3600)
-                    except KeyboardInterrupt:
-                        print("\\nStopping Xray.")
-                        return 0
-                print(
-                    f"[{index}/{len(nodes)}] Instagram returned HTTP {response.status_code}; "
-                    "not treating this response as proof the node is broken."
-                )
-                return 2
-        except (ProxyError, OSError, RuntimeError) as exc:
-            print(f"[{index}/{len(nodes)}] Xray could not start ({type(exc).__name__}); trying next node.")
-        finally:
-            session.close()
+        elapsed = time.monotonic() - check_started
+        if response.status_code in (403, 429):
+            print(
+                f"Instagram returned HTTP {response.status_code}. "
+                "This is a destination restriction/rate limit, not proof that all nodes are broken. "
+                "Stopping without automatic rotation."
+            )
+            return 2
+        if not 200 <= response.status_code < 400:
+            print(
+                f"Instagram returned HTTP {response.status_code}; "
+                "the selected route was not confirmed as working."
+            )
+            return 2
 
-    print("No node passed the public endpoint check.")
-    return 1
+        print("Instagram reachability check passed.")
+        print(f"HTTP status: {response.status_code}; response time: {elapsed:.2f}s")
+        print(f"Local SOCKS5 endpoint: {proxy.socks_url}")
+        print("Xray's leastPing balancer remains active; new connections can use its current best node.")
+        print("Keep this process running. Press Ctrl-C to stop Xray.")
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nStopping Xray.")
+        return 0
+    except (ProxyError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        stop_progress.set()
+        if worker.is_alive():
+            worker.join(timeout=1)
+        session.close()
+        proxy.stop()
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (RuntimeError, urllib.error.URLError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())
