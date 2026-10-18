@@ -1,6 +1,6 @@
 # Termux example: check an Instagram route
 
-This example uses only the public API of this repository's `xray-proxy` package. It does not log in to Instagram, read account data, or modify system-wide Android routing.
+This example uses the public `SubscriptionProxy` API from this repository. Xray Observatory probes supported VLESS/VMess outbounds concurrently and the `leastPing` balancer selects a route for new connections. The script does not start a separate Xray process for every node and never prints share links.
 
 ## Install
 
@@ -11,17 +11,21 @@ pkg install python
 python -m pip install -e '.[socks]'
 ```
 
-Install Xray-core separately and confirm that it runs:
+Install Xray-core separately and confirm it runs:
 
 ```bash
-xray version
+~/bin/xray version
 ```
 
-If your binary is at `~/bin/xray`, the script uses that path by default. Otherwise set `XRAY_PATH`.
+## Supply the subscription URL
 
-## Supply nodes
+Preferred: put the HTTPS subscription URL in a private environment variable:
 
-Preferred: save the provider's subscription response locally, with one VLESS/VMess URI per line (plain text or Base64), in a private file:
+```bash
+export XRAY_PROXY_SUBSCRIPTION_URL='https://your-provider.example/subscription'
+```
+
+Or put exactly one subscription URL in the private local file:
 
 ```bash
 mkdir -p ~/.config/xray-proxy
@@ -30,35 +34,29 @@ nano ~/.config/xray-proxy/subscription.txt
 chmod 600 ~/.config/xray-proxy/subscription.txt
 ```
 
-Do not share this file: proxy subscription links are credentials.
-
-Alternatively, provide a subscription URL through the environment (the subscription is downloaded directly, before Xray starts):
-
-```bash
-export XRAY_PROXY_SUBSCRIPTION_URL='https://your-provider.example/subscription'
-```
-
-Avoid putting a secret subscription URL in shell history. Prefer the private local file when possible.
+Do not commit or share the subscription URL; it may grant access to your proxy subscription. The current `SubscriptionProxy` API accepts a subscription URL, not a local file containing raw node URIs.
 
 ## Run
 
 From the repository root:
 
 ```bash
+git pull --ff-only
 python examples/instagram_check.py
 ```
 
-The script checks nodes sequentially against `https://www.instagram.com/robots.txt`, prints the local SOCKS5 endpoint for the first successful check, and keeps that Xray process running until Ctrl-C. It does not print share links.
+The live spinner shows that Xray is starting and warming up its concurrent Observatory. It is not a per-node percentage: the current library API does not expose individual probe progress. After warm-up, the script makes one real request to Instagram's public `robots.txt` endpoint and reports its HTTP status and latency.
 
-Optional settings:
+If successful, it prints the local SOCKS5 endpoint and keeps Xray running until Ctrl-C. The endpoint is local to this device and only affects apps explicitly configured to use it; it is not an Android-wide VPN.
+
+## Optional settings
 
 ```bash
 export XRAY_PATH="$HOME/bin/xray"
 export XRAY_PROXY_PORT=10808
-# If needed, override the default local subscription file:
-export XRAY_PROXY_SUBSCRIPTION_FILE="$HOME/.config/xray-proxy/subscription.txt"
+export XRAY_PROXY_PROBE_URL="https://www.google.com/generate_204"
+export XRAY_PROXY_PROBE_INTERVAL="5s"
+export XRAY_PROXY_PROBE_WARMUP=10
 ```
 
-The endpoint is local to the device: `socks5h://127.0.0.1:10808` by default. It affects only applications explicitly configured to use it; it is not an Android-wide VPN. The public endpoint check is only a basic reachability test, not a guarantee that Instagram login, feeds, uploads, or every app feature will work.
-
-If Instagram returns HTTP 403 or 429, the script stops instead of treating that response as a broken proxy and rotating through nodes. Respect service restrictions and rate limits.
+Use a probe URL that is reachable from your network through the candidate nodes. Observatory checks are HTTP(S) probes, not ICMP ping. A successful probe does not guarantee Instagram works, so the script separately checks Instagram. If Instagram returns HTTP 403 or 429, the script stops rather than rotating automatically; respect destination restrictions and rate limits.
