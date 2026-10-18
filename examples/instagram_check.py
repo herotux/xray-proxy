@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Find a working Xray SOCKS endpoint for a public Instagram reachability check.
 
-Input is either XRAY_PROXY_SUBSCRIPTION_URL or a private local subscription file.
-Share links are never printed. The first working node is kept alive until Ctrl-C.
-HTTP 403/429 is treated as a destination restriction/rate limit, not as a bad node.
+Input is XRAY_PROXY_SUBSCRIPTION_URL, a local subscription file containing either
+node URIs or a single HTTP(S) subscription URL. Share links are never printed.
+The first working node is kept alive until Ctrl-C.
 """
 from __future__ import annotations
 
@@ -26,44 +26,47 @@ MAX_SUBSCRIPTION_BYTES = 2_000_000
 MAX_NODES = 200
 
 
-def load_subscription() -> list[str]:
-    url = os.environ.get("XRAY_PROXY_SUBSCRIPTION_URL", "").strip()
-    if url:
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "xray-proxy-instagram-check/1.0"},
-        )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            raw = response.read(MAX_SUBSCRIPTION_BYTES + 1)
-        if len(raw) > MAX_SUBSCRIPTION_BYTES:
-            raise RuntimeError("Subscription is larger than 2 MB.")
-        source = raw.decode("utf-8-sig", errors="replace")
-    else:
-        path = Path(os.environ.get("XRAY_PROXY_SUBSCRIPTION_FILE", DEFAULT_SUBSCRIPTION_FILE))
-        if not path.is_file():
-            raise RuntimeError(
-                "Subscription file not found. Set XRAY_PROXY_SUBSCRIPTION_URL or "
-                f"create {path} with one VLESS/VMess URI per line."
-            )
-        if path.stat().st_size > MAX_SUBSCRIPTION_BYTES:
-            raise RuntimeError("Subscription file is larger than 2 MB.")
-        source = path.read_text(encoding="utf-8-sig", errors="replace")
+def download_subscription(url: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "xray-proxy-instagram-check/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        raw = response.read(MAX_SUBSCRIPTION_BYTES + 1)
+    if len(raw) > MAX_SUBSCRIPTION_BYTES:
+        raise RuntimeError("Subscription is larger than 2 MB.")
+    return raw.decode("utf-8-sig", errors="replace")
 
+
+def decode_subscription(source: str) -> list[str]:
     lines = [line.strip() for line in source.splitlines() if line.strip()]
-    if lines and not any(line.startswith(("vless://", "vmess://")) for line in lines):
+
+    # Subscription files may store the URL rather than the downloaded content.
+    if len(lines) == 1 and lines[0].lower().startswith(("https://", "http://")):
+        source = download_subscription(lines[0])
+        lines = [line.strip() for line in source.splitlines() if line.strip()]
+
+    # Decode base64 subscriptions (standard or URL-safe alphabet).
+    if lines and not any(line.lower().startswith(("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")) for line in lines):
+        compact = "".join(lines)
         try:
-            decoded = base64.b64decode("".join(lines) + "===", validate=False).decode(
-                "utf-8-sig", errors="replace"
+            decoded_bytes = base64.b64decode(
+                compact + "=" * (-len(compact) % 4),
+                altchars=b"-_",
+                validate=True,
             )
+            decoded = decoded_bytes.decode("utf-8-sig")
             if "://" in decoded:
-                lines = [line.strip() for line in decoded.splitlines() if line.strip()]
+                source = decoded
+                lines = [line.strip() for line in source.splitlines() if line.strip()]
         except (ValueError, UnicodeError):
             pass
 
     nodes: list[str] = []
     seen: set[str] = set()
     for line in lines:
-        if not line.startswith(("vless://", "vmess://")) or line in seen:
+        lowered = line.lower()
+        if not lowered.startswith(("vless://", "vmess://")) or line in seen:
             continue
         try:
             parse_proxy_uri(line)
@@ -73,9 +76,29 @@ def load_subscription() -> list[str]:
         nodes.append(line)
         if len(nodes) >= MAX_NODES:
             break
+
     if not nodes:
-        raise RuntimeError("No supported VLESS/VMess nodes found in the subscription.")
+        raise RuntimeError(
+            "No supported VLESS/VMess nodes found. Check the subscription URL/content and encoding."
+        )
     return nodes
+
+
+def load_subscription() -> list[str]:
+    url = os.environ.get("XRAY_PROXY_SUBSCRIPTION_URL", "").strip()
+    if url:
+        source = download_subscription(url)
+    else:
+        path = Path(os.environ.get("XRAY_PROXY_SUBSCRIPTION_FILE", DEFAULT_SUBSCRIPTION_FILE))
+        if not path.is_file():
+            raise RuntimeError(
+                "Subscription file not found. Set XRAY_PROXY_SUBSCRIPTION_URL or "
+                f"create {path} with node URIs or one subscription URL."
+            )
+        if path.stat().st_size > MAX_SUBSCRIPTION_BYTES:
+            raise RuntimeError("Subscription file is larger than 2 MB.")
+        source = path.read_text(encoding="utf-8-sig", errors="replace")
+    return decode_subscription(source)
 
 
 def main() -> int:
@@ -114,7 +137,7 @@ def main() -> int:
                         while True:
                             time.sleep(3600)
                     except KeyboardInterrupt:
-                        print("\nStopping Xray.")
+                        print("\\nStopping Xray.")
                         return 0
                 print(
                     f"[{index}/{len(nodes)}] Instagram returned HTTP {response.status_code}; "
