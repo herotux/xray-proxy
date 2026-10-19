@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check Instagram reachability through the library's concurrent Xray balancer.
 
-SubscriptionProxy lets Xray observatory probe many VLESS/VMess outbounds
-concurrently and routes requests through its leastPing balancer. The script
-does not launch one Xray process per node and never prints subscription links.
+Xray Observatory probes supported VLESS/VMess outbounds concurrently. The
+leastPing balancer ranks routes using the configured HTTP(S) probe endpoint.
+The script never prints subscription links.
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ CHECK_URL = "https://www.instagram.com/robots.txt"
 DEFAULT_SUBSCRIPTION_FILE = Path.home() / ".config/xray-proxy/subscription.txt"
 DEFAULT_XRAY_PATH = str(Path.home() / "bin/xray")
 DEFAULT_PORT = 10808
-DEFAULT_PROBE_URL = "https://www.google.com/generate_204"
+# Rank candidates against the actual destination, not Google, so the probe
+# better reflects whether the route can reach Instagram.
+DEFAULT_PROBE_URL = CHECK_URL
 
 
 def load_subscription_url() -> str:
@@ -37,34 +39,43 @@ def load_subscription_url() -> str:
     if path.stat().st_size > 2_000_000:
         raise RuntimeError("Subscription file is larger than 2 MB.")
 
-    lines = [line.strip() for line in path.read_text(
-        encoding="utf-8-sig", errors="replace"
-    ).splitlines() if line.strip()]
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        if line.strip()
+    ]
     if len(lines) == 1 and lines[0].lower().startswith(("https://", "http://")):
         return lines[0]
     raise RuntimeError(
-        "The current SubscriptionProxy API expects a subscription URL, not a local "
-        "file of raw node links. Put the subscription URL in the configured file or "
-        "set XRAY_PROXY_SUBSCRIPTION_URL."
+        "SubscriptionProxy expects a subscription URL, not a local file of raw node links. "
+        f"Put one subscription URL in {path} or set XRAY_PROXY_SUBSCRIPTION_URL."
     )
 
 
 def progress_worker(stop_event: threading.Event, started: float) -> None:
-    """Show honest live status while Xray probes nodes concurrently."""
+    """Use a single-line spinner on a TTY and readable status lines in captured output."""
     frames = "|/-\\"
     index = 0
-    while not stop_event.wait(0.15):
+    interactive = sys.stdout.isatty()
+    while not stop_event.wait(0.2):
         elapsed = time.monotonic() - started
         frame = frames[index % len(frames)]
-        print(
-            f"\r{frame} Xray Observatory is probing nodes concurrently"
-            f" | elapsed {elapsed:5.1f}s",
-            end="",
-            flush=True,
+        message = (
+            f"{frame} Xray Observatory probing concurrently"
+            f" | elapsed {elapsed:5.1f}s"
         )
+        if interactive:
+            sys.stdout.write("\r" + message)
+            sys.stdout.flush()
+        elif index == 0 or index % 10 == 0:
+            print(message, flush=True)
         index += 1
+
     elapsed = time.monotonic() - started
-    print(f"\r✓ Balancer startup/warm-up completed in {elapsed:.1f}s" + " " * 24)
+    if interactive:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+    print(f"Balancer startup/warm-up completed in {elapsed:.1f}s.")
 
 
 def main() -> int:
@@ -72,7 +83,7 @@ def main() -> int:
     xray_path = os.environ.get("XRAY_PATH", DEFAULT_XRAY_PATH)
     port = int(os.environ.get("XRAY_PROXY_PORT", str(DEFAULT_PORT)))
     probe_url = os.environ.get("XRAY_PROXY_PROBE_URL", DEFAULT_PROBE_URL)
-    warmup = float(os.environ.get("XRAY_PROXY_PROBE_WARMUP", "10"))
+    warmup = float(os.environ.get("XRAY_PROXY_PROBE_WARMUP", "15"))
     interval = os.environ.get("XRAY_PROXY_PROBE_INTERVAL", "5s")
 
     proxy = SubscriptionProxy(
@@ -87,29 +98,37 @@ def main() -> int:
     started = time.monotonic()
     stop_progress = threading.Event()
     worker = threading.Thread(
-        target=progress_worker, args=(stop_progress, started), daemon=True
+        target=progress_worker,
+        args=(stop_progress, started),
+        daemon=True,
     )
 
     try:
-        print("Starting Xray's concurrent Observatory / leastPing balancer.")
+        print("Starting Xray concurrent Observatory / leastPing balancer.")
         print(f"Probe endpoint: {probe_url}")
         print(f"Probe interval: {interval}; warm-up: {warmup:g}s")
+        print("Note: the spinner reports startup/warm-up, not a per-node percentage.")
         worker.start()
         proxy.start()
         stop_progress.set()
         worker.join()
-        session = proxy.configure_session(session)
+        proxy.configure_session(session)
 
-        # This single request is a real destination check. Observatory probes
-        # are concurrent; this request confirms the selected route can reach Instagram.
+        # Observatory probes all configured outbounds concurrently. This GET
+        # separately confirms the selected route can reach Instagram.
         check_started = time.monotonic()
         try:
-            response = session.get(CHECK_URL, timeout=(10, 20), allow_redirects=True)
+            response = session.get(
+                CHECK_URL,
+                timeout=(15, 30),
+                allow_redirects=True,
+            )
         except requests.RequestException as exc:
             print(
-                f"Instagram reachability check failed ({type(exc).__name__}). "
-                "The balancer started, but no successful Instagram response was confirmed."
+                f"Instagram check failed: {type(exc).__name__}: {exc}. "
+                "Xray started, but Instagram reachability was not confirmed."
             )
+            print("The proxy will be stopped; no automatic rotation or repeated retries.")
             return 2
 
         elapsed = time.monotonic() - check_started
@@ -130,8 +149,8 @@ def main() -> int:
         print("Instagram reachability check passed.")
         print(f"HTTP status: {response.status_code}; response time: {elapsed:.2f}s")
         print(f"Local SOCKS5 endpoint: {proxy.socks_url}")
-        print("Xray's leastPing balancer remains active; new connections can use its current best node.")
-        print("Keep this process running. Press Ctrl-C to stop Xray.")
+        print("The leastPing balancer remains active. Keep this process running.")
+        print("Press Ctrl-C to stop Xray.")
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
